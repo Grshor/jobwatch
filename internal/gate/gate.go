@@ -11,7 +11,7 @@ import (
 	"os/exec"
 	"strings"
 
-	"github.com/Grshor/jobwatch/internal/hh"
+	"github.com/Grshor/jobwatch/internal/model"
 )
 
 // Verdict of one gate decision.
@@ -33,7 +33,7 @@ type Gate struct {
 }
 
 // Decide asks the local decider about one vacancy.
-func (g Gate) Decide(ctx context.Context, v hh.Vacancy) (Verdict, error) {
+func (g Gate) Decide(ctx context.Context, v model.Vacancy) (Verdict, error) {
 	cmd := exec.CommandContext(ctx, g.LMBin, "decide",
 		"--question", g.Question,
 		"--options", "да,нет,сомнительно",

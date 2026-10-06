@@ -14,6 +14,8 @@ import (
 	"github.com/Grshor/jobwatch/internal/agent"
 	"github.com/Grshor/jobwatch/internal/gate"
 	"github.com/Grshor/jobwatch/internal/hh"
+	"github.com/Grshor/jobwatch/internal/hirify"
+	"github.com/Grshor/jobwatch/internal/model"
 	"github.com/Grshor/jobwatch/internal/store"
 	"github.com/Grshor/jobwatch/internal/tg"
 )
@@ -23,9 +25,11 @@ type Config struct {
 	Interval  time.Duration `yaml:"interval"`
 	StatePath string        `yaml:"state_path"`
 	Queries   []struct {
-		Text       string `yaml:"text"`
-		AreaID     int    `yaml:"area_id"`
-		RemoteOnly bool   `yaml:"remote_only"`
+		Source      string `yaml:"source"` // hh | hirify
+		Text        string `yaml:"text"`
+		AreaID      int    `yaml:"area_id"`
+		RemoteOnly  bool   `yaml:"remote_only"`
+		HirifyPages int    `yaml:"hirify_pages"`
 	} `yaml:"queries"`
 	Gate struct {
 		Bin      string `yaml:"bin"`
@@ -45,6 +49,7 @@ type Config struct {
 
 type Daemon struct {
 	cfg    Config
+	hirify *hirify.Client
 	gate   gate.Gate
 	agent  agent.Analyzer
 	tg     *tg.Client
@@ -59,7 +64,7 @@ type Daemon struct {
 // New wires everything from config; stdout=true prints cards instead of
 // sending them (dry run).
 func New(cfg Config, st *store.State, stdout bool) *Daemon {
-	d := &Daemon{cfg: cfg, stdout: stdout, st: st}
+	d := &Daemon{cfg: cfg, stdout: stdout, st: st, hirify: hirify.New()}
 	d.gate = gate.Gate{LMBin: cfg.Gate.Bin, Question: cfg.Gate.Question}
 	d.agent = agent.Analyzer{Bin: "omp", WorkDir: cfg.Agent.WorkDir, ResumeHint: cfg.Agent.ResumeHint}
 	if !stdout {
@@ -72,11 +77,24 @@ func New(cfg Config, st *store.State, stdout bool) *Daemon {
 // are logged, not fatal.
 func (d *Daemon) Cycle(ctx context.Context) {
 	d.countReset()
-	var candidates []hh.Vacancy
+	var candidates []model.Vacancy
 	for _, q := range d.cfg.Queries {
-		vs, err := hh.Search(ctx, hh.SearchURL(q.Text, q.AreaID, q.RemoteOnly))
+		var (
+			vs  []model.Vacancy
+			err error
+		)
+		switch q.Source {
+		case "hirify":
+			pages := q.HirifyPages
+			if pages == 0 {
+				pages = 2
+			}
+			vs, err = d.hirify.Search(ctx, q.Text, pages)
+		default:
+			vs, err = hh.Search(ctx, hh.SearchURL(q.Text, q.AreaID, q.RemoteOnly))
+		}
 		if err != nil {
-			log.Printf("query %q: %v", q.Text, err)
+			log.Printf("query %s/%q: %v", q.Source, q.Text, err)
 			continue
 		}
 		for _, v := range vs {
@@ -124,7 +142,7 @@ func (d *Daemon) Cycle(ctx context.Context) {
 	}
 }
 
-func (d *Daemon) analyzeAndNotify(ctx context.Context, v hh.Vacancy) {
+func (d *Daemon) analyzeAndNotify(ctx context.Context, v model.Vacancy) {
 	a, err := d.agent.Analyze(ctx, v)
 	if err != nil {
 		log.Printf("agent %s: %v", v.ID, err)
@@ -139,7 +157,7 @@ func (d *Daemon) analyzeAndNotify(ctx context.Context, v hh.Vacancy) {
 	d.send(v, a)
 }
 
-func (d *Daemon) send(v hh.Vacancy, a agent.Analysis) {
+func (d *Daemon) send(v model.Vacancy, a agent.Analysis) {
 	text := fmt.Sprintf("🔧 %s\n%s", v.Title, v.Compact())
 	if a.Traps != "" {
 		text += "\n\n⚠️ Ловушки:\n" + a.Traps
@@ -153,7 +171,13 @@ func (d *Daemon) send(v hh.Vacancy, a agent.Analysis) {
 	if a.Verdict == "unknown" {
 		text += "\n\n(агент-разбор не удался — только карточка)"
 	}
-	label := "Открыть на hh.ru"
+	label := "Открыть вакансию"
+	switch v.Source {
+	case "hh":
+		label = "Открыть на hh.ru"
+	case "hirify":
+		label = "Открыть на hirify"
+	}
 	if !d.stdout {
 		if err := d.tg.Card(context.Background(), text, label, v.URL); err != nil {
 			log.Printf("telegram: %v", err)

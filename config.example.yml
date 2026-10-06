@@ -3,12 +3,17 @@ interval: 15m
 state_path: state.json
 
 queries:
-  - text: "Golang"
+  - source: hh
+    text: "Golang"
     area_id: 1          # Moscow
     remote_only: false
-  - text: "Go разработчик"
+  - source: hh
+    text: "Go разработчик"
     area_id: 113        # Russia
     remote_only: true
+  - source: hirify
+    text: "golang"
+    hirify_pages: 2     # hirify live-search API, anonymous
 
 gate:
   bin: lm

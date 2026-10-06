@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Grshor/jobwatch/internal/model"
 	"golang.org/x/net/html"
 )
 
@@ -46,7 +47,7 @@ func SearchURL(text string, areaID int, remoteOnly bool) string {
 }
 
 // Search fetches and parses one search page.
-func Search(ctx context.Context, pageURL string) ([]Vacancy, error) {
+func Search(ctx context.Context, pageURL string) ([]model.Vacancy, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, pageURL, nil)
 	if err != nil {
 		return nil, err
@@ -70,8 +71,8 @@ func Search(ctx context.Context, pageURL string) ([]Vacancy, error) {
 }
 
 // parse walks the DOM for data-qa="vacancy-serp__vacancy" containers.
-func parse(root *html.Node) []Vacancy {
-	var out []Vacancy
+func parse(root *html.Node) []model.Vacancy {
+	var out []model.Vacancy
 	seen := map[string]bool{}
 	var walk func(*html.Node)
 	walk = func(n *html.Node) {
@@ -89,8 +90,9 @@ func parse(root *html.Node) []Vacancy {
 	return out
 }
 
-func parseCard(card *html.Node) (Vacancy, bool) {
-	var v Vacancy
+func parseCard(card *html.Node) (model.Vacancy, bool) {
+	var v model.Vacancy
+	v.Source = "hh"
 	var walk func(*html.Node)
 	walk = func(n *html.Node) {
 		if n.Type != html.ElementNode {
@@ -102,7 +104,7 @@ func parseCard(card *html.Node) (Vacancy, bool) {
 			if v.URL == "" {
 				href := attr(n, "href")
 				v.URL = absolute(href)
-				v.ID = idFrom(href)
+				v.ID = "hh:" + idFrom(href)
 			}
 			if v.Title == "" {
 				v.Title = strings.TrimSpace(text(n))
@@ -110,7 +112,7 @@ func parseCard(card *html.Node) (Vacancy, bool) {
 		case n.Data == "a" && v.URL == "" && strings.Contains(attr(n, "href"), "/vacancy/"):
 			href := attr(n, "href")
 			v.URL = absolute(href)
-			v.ID = idFrom(href)
+			v.ID = "hh:" + idFrom(href)
 			if v.Title == "" {
 				v.Title = strings.TrimSpace(text(n))
 			}
@@ -132,8 +134,8 @@ func parseCard(card *html.Node) (Vacancy, bool) {
 		}
 	}
 	walk(card)
-	if v.ID == "" || v.Title == "" {
-		return Vacancy{}, false
+	if v.ID == "hh:" || v.Title == "" {
+		return model.Vacancy{}, false
 	}
 	return v, true
 }
@@ -193,25 +195,4 @@ func text(n *html.Node) string {
 	}
 	walk(n)
 	return b.String()
-}
-
-// Compact renders a vacancy as plain text for the gate/agent prompts.
-func (v Vacancy) Compact() string {
-	parts := []string{v.Title}
-	if v.Employer != "" {
-		parts = append(parts, "работодатель: "+v.Employer)
-	}
-	if v.Compensation != "" {
-		parts = append(parts, "зарплата: "+v.Compensation)
-	}
-	if v.Experience != "" {
-		parts = append(parts, "опыт: "+v.Experience)
-	}
-	if v.Address != "" {
-		parts = append(parts, v.Address)
-	}
-	if v.Remote {
-		parts = append(parts, "удалёнка")
-	}
-	return strings.Join(parts, "; ")
 }

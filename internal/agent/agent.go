@@ -12,10 +12,10 @@ import (
 	"strings"
 	"time"
 
-	"github.com/Grshor/jobwatch/internal/hh"
+	"github.com/Grshor/jobwatch/internal/model"
 )
 
-const defaultTimeout = 6 * time.Minute
+const defaultTimeout = 12 * time.Minute
 
 // Analyzer runs one headless omp analysis.
 type Analyzer struct {
@@ -47,7 +47,7 @@ const promptTmpl = `Ты помогаешь кандидату (senior Go backen
 // Analyze runs the agent synchronously; ctx cancellation aborts. The agent
 // receives the card summary plus the vacancy URL — it opens the page itself
 // with its own tools and reads the full description.
-func (a Analyzer) Analyze(ctx context.Context, v hh.Vacancy) (Analysis, error) {
+func (a Analyzer) Analyze(ctx context.Context, v model.Vacancy) (Analysis, error) {
 	timeout := a.Timeout
 	if timeout == 0 {
 		timeout = defaultTimeout
