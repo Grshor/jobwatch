@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -77,6 +78,15 @@ func New(cfg Config, st *store.State, stdout bool) *Daemon {
 	if key := os.Getenv("HIRIFY_AGENT_KEY"); key != "" {
 		cfg.Hirify.Key = key
 	}
+	home, _ := os.UserHomeDir()
+	expand := func(p string) string {
+		if home != "" && strings.HasPrefix(p, "~/") {
+			return filepath.Join(home, p[2:])
+		}
+		return p
+	}
+	cfg.Agent.WorkDir = expand(cfg.Agent.WorkDir)
+	cfg.Agent.ResumeHint = expand(cfg.Agent.ResumeHint)
 	d := &Daemon{cfg: cfg, stdout: stdout, st: st}
 	if cfg.Hirify.Key != "" {
 		d.hirify = hirify.New(cfg.Hirify.Key)

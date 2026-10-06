@@ -38,6 +38,35 @@ func New(key string) *Client {
 	return &Client{Key: key, BaseURL: "https://api.hirify.me", hc: &http.Client{Timeout: 30 * time.Second}}
 }
 
+// grades accepts both shapes hirify serves: ["senior"] (Agent API) and
+// [{"id":3,"name":"senior"}] (anonymous endpoint).
+type grades []struct{ Name string }
+
+func (g *grades) UnmarshalJSON(b []byte) error {
+	var elems []json.RawMessage
+	if err := json.Unmarshal(b, &elems); err != nil {
+		return err
+	}
+	for _, e := range elems {
+		var name string
+		if len(e) > 0 && e[0] == '"' {
+			if err := json.Unmarshal(e, &name); err != nil {
+				return err
+			}
+		} else {
+			var o struct {
+				Name string `json:"name"`
+			}
+			if err := json.Unmarshal(e, &o); err != nil {
+				return err
+			}
+			name = o.Name
+		}
+		*g = append(*g, struct{ Name string }{name})
+	}
+	return nil
+}
+
 func (c *Client) get(ctx context.Context, path string, out any) error {
 	return c.do(ctx, http.MethodGet, path, nil, out)
 }
@@ -101,59 +130,77 @@ func (c *Client) Me(ctx context.Context) (json.RawMessage, error) {
 	return me, err
 }
 
+// card is the Agent API's compact vacancy card. Note: the company title is
+// deliberately absent (company_masked) — anti-doxxing; the agent reads it
+// from the vacancy page.
 type card struct {
-	ID           int      `json:"id"`
+	VacancyID    int      `json:"vacancy_id"`
 	Slug         string   `json:"slug"`
 	Title        string   `json:"title"`
-	CompanyTitle string   `json:"company_title"`
-	CompanyType  string   `json:"company_type"`
-	MainStack    []string `json:"main_stack"`
+	Grades       grades   `json:"grades"`
+	EnglishLevel string   `json:"english_level"`
+	RemoteType   string   `json:"remote_type"`
 	WorkFormat   []string `json:"work_format"`
-	Grades       []struct {
-		Name string `json:"name"`
-	} `json:"grades"`
-	EnglishLevel string `json:"english_level"`
-	TLDR         string `json:"tldr"`
 	Salary       *struct {
 		Currency    string `json:"currency"`
 		Min         *int   `json:"min"`
 		Max         *int   `json:"max"`
 		SalaryInUSD *int   `json:"salary_in_usd"`
 	} `json:"salary"`
-	IsScam          bool   `json:"is_scam"`
-	IsPotentialScam bool   `json:"is_potential_scam"`
-	CreatedAt       string `json:"created_at"`
+	Skills           []string `json:"skills"`
+	Cities           []string `json:"cities"`
+	CanApplyDirectly bool     `json:"can_apply_directly"`
+	HasApplied       bool     `json:"has_applied"`
+	CompanyMasked    bool     `json:"company_masked"`
 }
 
-func (v card) toModel() model.Vacancy {
-	m := model.Vacancy{
-		Source:   "hirify",
-		ID:       fmt.Sprintf("hirify:%d", v.ID),
-		Slug:     v.Slug,
-		Title:    v.Title,
-		Employer: v.CompanyTitle,
-		URL:      "https://hirify.me/jobs/" + v.Slug,
+func (c *Client) search(ctx context.Context, f Filters, page, perPage int) ([]card, error) {
+	q := url.Values{}
+	if f.Search != "" {
+		q.Set("search", f.Search)
 	}
-	// the anonymous-adapter extras survive: the gate keeps its eyes
-	m.Extra = extras(v)
-	return m
-}
+	if len(f.Params) > 0 {
+		q.Set("params", strings.Join(f.Params, ","))
+	}
+	if f.SortBy != "" {
+		q.Set("sort_by", f.SortBy)
+	}
+	if f.Period != "" {
+		q.Set("period", f.Period)
+	}
+	if len(f.Grade) > 0 {
+		q.Set("grade", strings.Join(f.Grade, ","))
+	}
+	if len(f.WorkFormat) > 0 {
+		q.Set("work_format", strings.Join(f.WorkFormat, ","))
+	}
+	if len(f.RemoteType) > 0 {
+		q.Set("remote_type", strings.Join(f.RemoteType, ","))
+	}
+	q.Set("page", fmt.Sprint(page))
+	q.Set("per_page", fmt.Sprint(perPage))
 
-func (c *Client) Search(ctx context.Context, f Filters, page, perPage int) ([]model.Vacancy, error) {
-	filtersJSON, err := json.Marshal(f)
-	if err != nil {
-		return nil, err
-	}
 	var data []card
-	// query-object serialization: Laravel accepts filters as JSON string
-	path := fmt.Sprintf("/api/agent/vacancies?filters=%s&page=%d&per_page=%d",
-		url.QueryEscape(string(filtersJSON)), page, perPage)
-	if err := c.get(ctx, path, &data); err != nil {
+	if err := c.get(ctx, "/api/agent/vacancies?"+q.Encode(), &data); err != nil {
 		return nil, err
 	}
-	out := make([]model.Vacancy, 0, len(data))
-	for _, v := range data {
-		out = append(out, v.toModel())
+	return data, nil
+}
+
+// Search walks up to pages pages of Agent API results.
+func (c *Client) Search(ctx context.Context, f Filters, pages, perPage int) ([]model.Vacancy, error) {
+	var out []model.Vacancy
+	for p := 1; p <= pages; p++ {
+		cards, err := c.search(ctx, f, p, perPage)
+		if err != nil {
+			return out, err
+		}
+		for _, v := range cards {
+			out = append(out, v.toModel())
+		}
+		if len(cards) < perPage {
+			break
+		}
 	}
 	return out, nil
 }
@@ -189,39 +236,63 @@ func (c *Client) FeedVacancies(ctx context.Context, feedID, page, perPage int) (
 	return out, nil
 }
 
-func extras(v card) string {
-	var extra []string
-	if v.CompanyType != "" {
-		extra = append(extra, "тип компании: "+humanCompany(v.CompanyType))
+func gradeNames(g grades) []string {
+	names := make([]string, len(g))
+	for i, x := range g {
+		names[i] = x.Name
 	}
-	if len(v.MainStack) > 0 {
-		extra = append(extra, "стек: "+strings.Join(v.MainStack, ", "))
+	return names
+}
+
+func (v card) toModel() model.Vacancy {
+	m := model.Vacancy{
+		Source:     "hirify",
+		ID:         fmt.Sprintf("hirify:%d", v.VacancyID),
+		Slug:       v.Slug,
+		Title:      v.Title,
+		URL:        "https://hirify.me/jobs/" + v.Slug,
+		Experience: strings.Join(gradeNames(v.Grades), "/"),
+	}
+	for _, f := range v.WorkFormat {
+		if f == "remote" {
+			m.Remote = true
+			break
+		}
+	}
+	if v.Salary != nil {
+		s := v.Salary
+		switch {
+		case s.Min != nil && s.Max != nil:
+			m.Compensation = fmt.Sprintf("%d–%d %s", *s.Min, *s.Max, s.Currency)
+		case s.Min != nil:
+			m.Compensation = fmt.Sprintf("от %d %s", *s.Min, s.Currency)
+		case s.Max != nil:
+			m.Compensation = fmt.Sprintf("до %d %s", *s.Max, s.Currency)
+		}
+		if s.SalaryInUSD != nil {
+			m.Compensation += fmt.Sprintf(" (~$%d)", *s.SalaryInUSD)
+		}
+	}
+	var extra []string
+	if len(v.Skills) > 0 {
+		s := v.Skills
+		if len(s) > 8 {
+			s = s[:8]
+		}
+		extra = append(extra, "навыки: "+strings.Join(s, ", "))
 	}
 	if v.EnglishLevel != "" {
 		extra = append(extra, "английский: "+v.EnglishLevel)
 	}
+	if v.RemoteType != "" {
+		extra = append(extra, "remote: "+v.RemoteType)
+	}
 	switch {
-	case v.IsScam:
-		extra = append(extra, "⚠️HIRIFY-ФЛАГ: SCAM")
-	case v.IsPotentialScam:
-		extra = append(extra, "⚠️hirify: потенциальный скам")
+	case v.HasApplied:
+		extra = append(extra, "уже откликался")
+	case !v.CanApplyDirectly:
+		extra = append(extra, "прямой отклик недоступен")
 	}
-	if strings.TrimSpace(v.TLDR) != "" {
-		t := v.TLDR
-		if len(t) > 200 {
-			t = t[:200] + "…"
-		}
-		extra = append(extra, "кратко: "+t)
-	}
-	return strings.Join(extra, "; ")
-}
-
-func humanCompany(t string) string {
-	switch t {
-	case "product_company":
-		return "продукт"
-	case "agency", "outsourcing", "outstaff":
-		return "аутстафф/агентство ⚠️"
-	}
-	return t
+	m.Extra = strings.Join(extra, "; ")
+	return m
 }
