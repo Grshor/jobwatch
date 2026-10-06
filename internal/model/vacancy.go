@@ -16,6 +16,8 @@ type Vacancy struct {
 	Experience   string `json:"experience,omitempty"`
 	Remote       bool   `json:"remote,omitempty"`
 	URL          string `json:"url"`
+	// Slug: source-native identifier for API actions (hirify apply).
+	Slug string `json:"slug,omitempty"`
 	// Extra: source-specific context the gate should see (company type,
 	// stack, scam flags) — rendered by Compact.
 	Extra string `json:"extra,omitempty"`

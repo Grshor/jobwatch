@@ -26,6 +26,11 @@ agent:
   work_dir: ~/Projects/career/jobseeker
   resume_hint: ~/Projects/career/jobseeker/resume-2026.md
 
+hirify:
+  key: ""            # or env HIRIFY_AGENT_KEY — hirify.me/account/api-access
+  profile_id: null   # optional: profile from POST /api/agent/profiles
+  apply_enabled: false  # true = the TG button really applies (agent:apply key)
+
 telegram:
   token: ""      # or env JOBWATCH_TG_TOKEN
   chat_id: 0

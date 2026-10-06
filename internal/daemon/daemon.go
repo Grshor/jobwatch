@@ -8,6 +8,8 @@ import (
 	"context"
 	"fmt"
 	"log"
+	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -25,11 +27,14 @@ type Config struct {
 	Interval  time.Duration `yaml:"interval"`
 	StatePath string        `yaml:"state_path"`
 	Queries   []struct {
-		Source      string `yaml:"source"` // hh | hirify
-		Text        string `yaml:"text"`
-		AreaID      int    `yaml:"area_id"`
-		RemoteOnly  bool   `yaml:"remote_only"`
-		HirifyPages int    `yaml:"hirify_pages"`
+		Source      string   `yaml:"source"` // hh | hirify
+		Text        string   `yaml:"text"`
+		AreaID      int      `yaml:"area_id"`
+		RemoteOnly  bool     `yaml:"remote_only"`
+		HirifyPages int      `yaml:"hirify_pages"`
+		Grade       []string `yaml:"grade"`
+		WorkFormat  []string `yaml:"work_format"`
+		RemoteType  []string `yaml:"remote_type"`
 	} `yaml:"queries"`
 	Gate struct {
 		Bin      string `yaml:"bin"`
@@ -43,6 +48,11 @@ type Config struct {
 		Token  string `yaml:"token"`
 		ChatID int64  `yaml:"chat_id"`
 	} `yaml:"telegram"`
+	Hirify struct {
+		Key          string `yaml:"key"` // or env HIRIFY_AGENT_KEY; needs agent:apply for buttons
+		ProfileID    *int   `yaml:"profile_id"`
+		ApplyEnabled bool   `yaml:"apply_enabled"`
+	} `yaml:"hirify"`
 	MaxAnalyzePerCycle int `yaml:"max_analyze_per_cycle"`
 	MaxCardsPerDay     int `yaml:"max_cards_per_day"`
 }
@@ -64,13 +74,47 @@ type Daemon struct {
 // New wires everything from config; stdout=true prints cards instead of
 // sending them (dry run).
 func New(cfg Config, st *store.State, stdout bool) *Daemon {
-	d := &Daemon{cfg: cfg, stdout: stdout, st: st, hirify: hirify.New()}
+	if key := os.Getenv("HIRIFY_AGENT_KEY"); key != "" {
+		cfg.Hirify.Key = key
+	}
+	d := &Daemon{cfg: cfg, stdout: stdout, st: st}
+	if cfg.Hirify.Key != "" {
+		d.hirify = hirify.New(cfg.Hirify.Key)
+	}
 	d.gate = gate.Gate{LMBin: cfg.Gate.Bin, Question: cfg.Gate.Question}
 	d.agent = agent.Analyzer{Bin: "omp", WorkDir: cfg.Agent.WorkDir, ResumeHint: cfg.Agent.ResumeHint}
 	if !stdout {
 		d.tg = tg.New(cfg.TG.Token, cfg.TG.ChatID)
 	}
 	return d
+}
+
+// ServeCallbacks runs the TG apply-button loop until ctx is done. Only
+// hirify vacancies are appliable through the official API; hh stays URL-only.
+func (d *Daemon) ServeCallbacks(ctx context.Context) {
+	if d.tg == nil || d.hirify == nil {
+		return
+	}
+	d.tg.Poll(ctx, "apply:", func(cbID, data string) {
+		id := strings.TrimPrefix(data, "apply:")
+		slug, letter, ok := d.st.Cover(id)
+		if !ok {
+			d.tg.AnswerCallback(ctx, cbID, "Отклик недоступен (нет письма или уже отправлен)")
+			return
+		}
+		if !d.cfg.Hirify.ApplyEnabled {
+			d.tg.AnswerCallback(ctx, cbID, "apply_enabled: false в конфиге")
+			return
+		}
+		if err := d.hirify.Apply(ctx, slug, letter, d.cfg.Hirify.ProfileID); err != nil {
+			d.tg.AnswerCallback(ctx, cbID, "Ошибка: "+err.Error())
+			log.Printf("apply %s: %v", id, err)
+			return
+		}
+		d.st.MarkApplied(id)
+		d.tg.AnswerCallback(ctx, cbID, "✅ Отклик отправлен")
+		log.Printf("applied via hirify API: %s", id)
+	})
 }
 
 // Cycle runs one fetch→gate→analyze→notify pass. Blocking; errors per stage
@@ -85,11 +129,15 @@ func (d *Daemon) Cycle(ctx context.Context) {
 		)
 		switch q.Source {
 		case "hirify":
+			if d.hirify == nil {
+				log.Printf("hirify key not configured — skipping hirify query %q", q.Text)
+				continue
+			}
 			pages := q.HirifyPages
 			if pages == 0 {
 				pages = 2
 			}
-			vs, err = d.hirify.Search(ctx, q.Text, pages)
+			vs, err = d.searchHirify(ctx, q, pages)
 		default:
 			vs, err = hh.Search(ctx, hh.SearchURL(q.Text, q.AreaID, q.RemoteOnly))
 		}
@@ -142,6 +190,32 @@ func (d *Daemon) Cycle(ctx context.Context) {
 	}
 }
 
+// searchHirify walks up to pages pages of the official Agent API search.
+func (d *Daemon) searchHirify(ctx context.Context, q struct {
+	Source      string   `yaml:"source"`
+	Text        string   `yaml:"text"`
+	AreaID      int      `yaml:"area_id"`
+	RemoteOnly  bool     `yaml:"remote_only"`
+	HirifyPages int      `yaml:"hirify_pages"`
+	Grade       []string `yaml:"grade"`
+	WorkFormat  []string `yaml:"work_format"`
+	RemoteType  []string `yaml:"remote_type"`
+}, pages int) ([]model.Vacancy, error) {
+	f := hirify.Filters{Search: q.Text, Params: []string{"title", "company"}, Grade: q.Grade, WorkFormat: q.WorkFormat, RemoteType: q.RemoteType}
+	var out []model.Vacancy
+	for p := 1; p <= pages; p++ {
+		vs, err := d.hirify.Search(ctx, f, p, 50)
+		if err != nil {
+			return out, err
+		}
+		out = append(out, vs...)
+		if len(vs) < 50 {
+			break
+		}
+	}
+	return out, nil
+}
+
 func (d *Daemon) analyzeAndNotify(ctx context.Context, v model.Vacancy) {
 	a, err := d.agent.Analyze(ctx, v)
 	if err != nil {
@@ -153,6 +227,9 @@ func (d *Daemon) analyzeAndNotify(ctx context.Context, v model.Vacancy) {
 		d.st.Mark(v.ID, "agent-пропускать")
 		log.Printf("agent skips %s (%s)", v.ID, v.Title)
 		return
+	}
+	if a.Letter != "" && v.Source == "hirify" && v.Slug != "" {
+		d.st.SetCover(v.ID, v.Slug, a.Letter)
 	}
 	d.send(v, a)
 }
@@ -179,12 +256,26 @@ func (d *Daemon) send(v model.Vacancy, a agent.Analysis) {
 		label = "Открыть на hirify"
 	}
 	if !d.stdout {
-		if err := d.tg.Card(context.Background(), text, label, v.URL); err != nil {
+		_, canApply := "", false
+		if _, letter, ok := d.st.Cover(v.ID); ok && letter != "" && d.cfg.Hirify.ApplyEnabled {
+			canApply = true
+		}
+		var err error
+		if canApply {
+			err = d.tg.CardWithApply(context.Background(), text, "✅ Откликнуться (hirify)", "apply:"+v.ID, label, v.URL)
+		} else {
+			err = d.tg.Card(context.Background(), text, label, v.URL)
+		}
+		if err != nil {
 			log.Printf("telegram: %v", err)
 			return
 		}
 	} else {
-		fmt.Printf("=== CARD ===\n%s\n%s\n", text, v.URL)
+		hint := ""
+		if _, _, ok := d.st.Cover(v.ID); ok {
+			hint = " [кнопка отклика активна]"
+		}
+		fmt.Printf("=== CARD ===\n%s\n%s%s\n", text, v.URL, hint)
 	}
 	d.countCard()
 }

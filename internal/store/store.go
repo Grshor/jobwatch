@@ -14,6 +14,35 @@ import (
 type Entry struct {
 	Seen    time.Time `json:"seen"`
 	Verdict string    `json:"verdict,omitempty"`
+	Letter  string    `json:"letter,omitempty"` // agent-drafted cover letter
+	Slug    string    `json:"slug,omitempty"`   // hirify slug for apply
+	Applied bool      `json:"applied,omitempty"`
+}
+
+// SetCover stores the letter+slug for a later apply callback.
+func (s *State) SetCover(id, slug, letter string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	e := s.Seen[id]
+	e.Slug, e.Letter = slug, letter
+	s.Seen[id] = e
+}
+
+// Cover returns the stored apply payload for id.
+func (s *State) Cover(id string) (slug, letter string, ok bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	e, ok := s.Seen[id]
+	return e.Slug, e.Letter, ok && e.Slug != "" && e.Letter != "" && !e.Applied
+}
+
+// MarkApplied flags the vacancy as responded.
+func (s *State) MarkApplied(id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	e := s.Seen[id]
+	e.Applied = true
+	s.Seen[id] = e
 }
 
 type State struct {
