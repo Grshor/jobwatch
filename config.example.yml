@@ -1,0 +1,29 @@
+# jobwatch — config example. Copy to config.yml and fill.
+interval: 15m
+state_path: state.json
+
+queries:
+  - text: "Golang"
+    area_id: 1          # Moscow
+    remote_only: false
+  - text: "Go разработчик"
+    area_id: 113        # Russia
+    remote_only: true
+
+gate:
+  bin: lm
+  question: >
+    Подходит ли вакансия под профиль кандидата: senior Go backend (5 лет),
+    Москва или удалёнка, не агентство и не аутстафф, не 1С и не Java,
+    зарплата от 400к gross?
+
+agent:
+  work_dir: ~/Projects/career/jobseeker
+  resume_hint: ~/Projects/career/jobseeker/resume-2026.md
+
+telegram:
+  token: ""      # or env JOBWATCH_TG_TOKEN
+  chat_id: 0
+
+max_analyze_per_cycle: 3
+max_cards_per_day: 10
