@@ -10,6 +10,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -55,17 +56,19 @@ type Config struct {
 		ApplyEnabled bool   `yaml:"apply_enabled"`
 	} `yaml:"hirify"`
 	MaxAnalyzePerCycle int `yaml:"max_analyze_per_cycle"`
+	AnalysisWorkers    int `yaml:"analysis_workers"`
 	MaxCardsPerDay     int `yaml:"max_cards_per_day"`
 }
 
 type Daemon struct {
-	cfg    Config
-	hirify *hirify.Client
-	gate   gate.Gate
-	agent  agent.Analyzer
-	tg     *tg.Client
-	stdout bool
-	st     *store.State
+	cfg        Config
+	hirify     *hirify.Client
+	resumeText string
+	gate       gate.Gate
+	agent      agent.Analyzer
+	tg         *tg.Client
+	stdout     bool
+	st         *store.State
 
 	mu        sync.Mutex
 	sentToday int
@@ -88,11 +91,17 @@ func New(cfg Config, st *store.State, stdout bool) *Daemon {
 	cfg.Agent.WorkDir = expand(cfg.Agent.WorkDir)
 	cfg.Agent.ResumeHint = expand(cfg.Agent.ResumeHint)
 	d := &Daemon{cfg: cfg, stdout: stdout, st: st}
+	if b, err := os.ReadFile(cfg.Agent.ResumeHint); err == nil {
+		d.resumeText = string(b)
+		log.Printf("resume loaded: %s (%d chars)", cfg.Agent.ResumeHint, len(b))
+	} else {
+		log.Printf("resume not readable (%v) — анализ будет без контекста резюме", err)
+	}
 	if cfg.Hirify.Key != "" {
 		d.hirify = hirify.New(cfg.Hirify.Key)
 	}
 	d.gate = gate.Gate{LMBin: cfg.Gate.Bin, Question: cfg.Gate.Question}
-	d.agent = agent.Analyzer{Bin: "omp", WorkDir: cfg.Agent.WorkDir, ResumeHint: cfg.Agent.ResumeHint}
+	d.agent = agent.Analyzer{Bin: "omp", WorkDir: cfg.Agent.WorkDir, ResumeText: d.resumeText, Timeout: 5 * time.Minute}
 	if !stdout {
 		d.tg = tg.New(cfg.TG.Token, cfg.TG.ChatID)
 	}
@@ -167,6 +176,7 @@ func (d *Daemon) Cycle(ctx context.Context) {
 	log.Printf("new candidates: %d", len(candidates))
 
 	analyzed := 0
+	var jobs []model.Vacancy
 	for _, v := range candidates {
 		if ctx.Err() != nil {
 			return
@@ -193,8 +203,29 @@ func (d *Daemon) Cycle(ctx context.Context) {
 			return
 		}
 		analyzed++
-		d.analyzeAndNotify(ctx, v)
+		jobs = append(jobs, v)
 	}
+	// parallel analyses: each is one plain model completion now
+	workers := d.cfg.AnalysisWorkers
+	if workers < 1 {
+		workers = 1
+	}
+	jch := make(chan model.Vacancy)
+	var wg sync.WaitGroup
+	for i := 0; i < workers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for v := range jch {
+				d.analyzeAndNotify(ctx, v)
+			}
+		}()
+	}
+	for _, v := range jobs {
+		jch <- v
+	}
+	close(jch)
+	wg.Wait()
 	if err := d.st.Save(); err != nil {
 		log.Printf("state save: %v", err)
 	}
@@ -227,16 +258,32 @@ func (d *Daemon) searchHirify(ctx context.Context, q struct {
 }
 
 func (d *Daemon) analyzeAndNotify(ctx context.Context, v model.Vacancy) {
-	a, err := d.agent.Analyze(ctx, v)
+	vacText := v.Compact()
+	if v.Source == "hirify" {
+		if idStr := strings.TrimPrefix(v.ID, "hirify:"); idStr != "" {
+			if id, err := strconv.Atoi(idStr); err == nil {
+				if fv, err := d.hirify.FullVacancy(ctx, id); err == nil {
+					vacText = fv.Render()
+				} else {
+					log.Printf("full vacancy %s: %v (fallback: карточка)", v.ID, err)
+				}
+			}
+		}
+	}
+
+	a, err := d.agent.AnalyzeText(ctx, vacText)
 	if err != nil {
 		log.Printf("agent %s: %v", v.ID, err)
 		// notify without analysis rather than silently dropping
 		a = agent.Analysis{Verdict: "unknown"}
 	}
-	if a.Verdict == "пропускать" {
+	switch a.Verdict {
+	case "пропускать":
 		d.st.Mark(v.ID, "agent-пропускать")
 		log.Printf("agent skips %s (%s)", v.ID, v.Title)
 		return
+	case "откликаться":
+		d.st.Mark(v.ID, "agent-откликаться")
 	}
 	if a.Letter != "" && v.Source == "hirify" && v.Slug != "" {
 		d.st.SetCover(v.ID, v.Slug, a.Letter)

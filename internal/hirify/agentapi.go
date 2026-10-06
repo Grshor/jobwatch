@@ -296,3 +296,71 @@ func (v card) toModel() model.Vacancy {
 	m.Extra = strings.Join(extra, "; ")
 	return m
 }
+
+// FullVacancy is the full vacancy payload from GET /vacancies/{id}.
+type FullVacancy struct {
+	Title   string `json:"title"`
+	Company string `json:"company"`
+	Salary  *struct {
+		Currency    string `json:"currency"`
+		Min         *int   `json:"min"`
+		Max         *int   `json:"max"`
+		SalaryInUSD *int   `json:"salary_in_usd"`
+	} `json:"salary"`
+	Grades       grades   `json:"grades"`
+	EnglishLevel string   `json:"english_level"`
+	WorkFormat   []string `json:"work_format"`
+	WorkType     string   `json:"work_type"`
+	Skills       []string `json:"skills"`
+	Description  string   `json:"description"`
+	Regions      []struct {
+		Name string `json:"name"`
+	} `json:"regions"`
+}
+
+// FullVacancy fetches the full card (counts toward the daily request limit).
+func (c *Client) FullVacancy(ctx context.Context, vacancyID int) (*FullVacancy, error) {
+	var f FullVacancy
+	if err := c.get(ctx, fmt.Sprintf("/api/agent/vacancies/%d", vacancyID), &f); err != nil {
+		return nil, err
+	}
+	return &f, nil
+}
+
+// Render renders the full vacancy as plain text for the analysis prompt.
+func (f *FullVacancy) Render() string {
+	var b strings.Builder
+	b.WriteString(f.Title)
+	if f.Company != "" {
+		b.WriteString("\nКомпания: " + f.Company)
+	}
+	if len(f.Grades) > 0 {
+		b.WriteString("\nГрейды: " + strings.Join(gradeNames(f.Grades), "/"))
+	}
+	if f.EnglishLevel != "" {
+		b.WriteString("\nАнглийский: " + f.EnglishLevel)
+	}
+	if len(f.WorkFormat) > 0 {
+		b.WriteString("\nФормат: " + strings.Join(f.WorkFormat, ", "))
+	}
+	if f.WorkType != "" {
+		b.WriteString("\nЗанятость: " + f.WorkType)
+	}
+	if len(f.Skills) > 0 {
+		b.WriteString("\nНавыки: " + strings.Join(f.Skills, ", "))
+	}
+	for _, r := range f.Regions {
+		b.WriteString("\nРегион: " + r.Name)
+	}
+	if f.Salary != nil {
+		s := f.Salary
+		switch {
+		case s.Min != nil && s.Max != nil:
+			b.WriteString(fmt.Sprintf("\nЗарплата: %d–%d %s", *s.Min, *s.Max, s.Currency))
+		case s.Min != nil:
+			b.WriteString(fmt.Sprintf("\nЗарплата: от %d %s", *s.Min, s.Currency))
+		}
+	}
+	b.WriteString("\n\n" + f.Description)
+	return b.String()
+}

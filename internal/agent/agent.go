@@ -1,7 +1,6 @@
-// Package agent: deep vacancy analysis through the user's own OMP agent,
-// run headless and session-less: one `omp --no-session -p` per surviving
-// vacancy. The agent reads the real resume files from disk — no resume text
-// is copied into prompts or logs beyond what the agent itself answers with.
+// Package agent: deep vacancy analysis. The daemon feeds the model the
+// vacancy's full text (fetched over the hirify Agent API) and the
+// candidate's resume text — one plain completion, no browsing, no tools.
 package agent
 
 import (
@@ -11,21 +10,11 @@ import (
 	"regexp"
 	"strings"
 	"time"
-
-	"github.com/Grshor/jobwatch/internal/model"
 )
 
-const defaultTimeout = 12 * time.Minute
+const defaultTimeout = 8 * time.Minute
 
-// Analyzer runs one headless omp analysis.
-type Analyzer struct {
-	Bin        string // "omp"
-	WorkDir    string // project with the resume files (agent reads them itself)
-	Timeout    time.Duration
-	ResumeHint string // extra context line (paths) baked into the prompt
-}
-
-// Analysis is the structured answer parsed out of the agent's reply.
+// Analysis is the structured answer parsed out of the model's reply.
 type Analysis struct {
 	Verdict string // откликаться | пропускать | unknown
 	Traps   string
@@ -34,20 +23,36 @@ type Analysis struct {
 	Raw     string
 }
 
-const promptTmpl = `Ты помогаешь кандидату (senior Go backend, Москва/удалёнка, ожидание от 400к gross) разобрать вакансию перед откликом. Резюме кандидата: %s — прочитай его. Карточка вакансии: %s. Полный текст открой по ссылке (прочитай URL-адрес инструментом): %s
+// Analyzer runs one headless omp completion.
+type Analyzer struct {
+	Bin        string
+	WorkDir    string
+	Timeout    time.Duration
+	ResumeText string // the candidate's resume, read once at startup
+}
 
-Проанализируй как придирчивый кандидат и ответь СТРОГО в этом формате:
+const promptTmpl = `Ты — придирчивый senior-кандидат, оцениваешь вакансию перед откликом. Ожидания: senior Go backend, Москва или удалёнка, от 400к gross, не агентство и не аутстафф.
+
+РЕЗЮМЕ КАНДИДАТА:
+<resume>
+%s
+</resume>
+
+ТЕКСТ ВАКАНСИИ:
+<vacancy>
+%s
+</vacancy>
+
+Проанализируй вакансию и ответь СТРОГО в этом формате (без markdown-разметки заголовков):
 
 ВЕРДИКТ: откликаться | пропускать
-ЛОВУШКИ: (скрининговые вопросы и «кодовые слова» в тексте, тестовое задание до отклика, вилка ниже ожиданий, агентство/аутстафф под видом продукта, признак мёртвой вакансии — по одной строке на пункт; если чисто — «нет»)
+ЛОВУШКИ: (скрининговые фильтры против резюме, вилки ниже ожиданий, агентство/аутстафф под видом продукта, тестовое до отклика, признаки мёртвой вакансии — по одной строке; если чисто — «нет»)
 СОВЕТ: (1–2 строки: какие буллеты резюме подчеркнуть под эту вакансию)
-ПИСЬМО: (сопроводительное от первого лица, 4–6 строк, по-русски, без воды и без выдуманного опыта)
+ПИСЬМО: (сопроводительное от первого лица, 4–6 строк, по-русски, только реальный опыт из резюме)
 `
 
-// Analyze runs the agent synchronously; ctx cancellation aborts. The agent
-// receives the card summary plus the vacancy URL — it opens the page itself
-// with its own tools and reads the full description.
-func (a Analyzer) Analyze(ctx context.Context, v model.Vacancy) (Analysis, error) {
+// AnalyzeText runs one completion over resume+vacancy texts.
+func (a Analyzer) AnalyzeText(ctx context.Context, vacancyText string) (Analysis, error) {
 	timeout := a.Timeout
 	if timeout == 0 {
 		timeout = defaultTimeout
@@ -55,27 +60,48 @@ func (a Analyzer) Analyze(ctx context.Context, v model.Vacancy) (Analysis, error
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
-	hint := a.ResumeHint
-	if hint == "" {
-		hint = "~/Projects/career/jobseeker/resume-2026.md"
+	prompt := fmt.Sprintf(promptTmpl, a.ResumeText, vacancyText)
+	args := []string{"--no-session", "-p", prompt}
+	if a.WorkDir != "" {
+		args = []string{"--no-session", "--cwd", a.WorkDir, "-p", prompt}
 	}
-	prompt := fmt.Sprintf(promptTmpl, hint, v.Compact(), v.URL)
-	cmd := exec.CommandContext(ctx, a.Bin, "--no-session", "--cwd", a.WorkDir, "-p", prompt)
-	var errBuf strings.Builder
+	cmd := exec.CommandContext(ctx, a.Bin, args...)
+	var errBuf, outBuf strings.Builder
 	cmd.Stderr = &errBuf
-	out, err := cmd.Output()
-	if err != nil {
+	cmd.Stdout = &outBuf
+	if err := cmd.Start(); err != nil {
+		return Analysis{}, fmt.Errorf("omp start: %w", err)
+	}
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	var runErr error
+timer:
+	for {
+		select {
+		case runErr = <-done:
+			break timer
+		case <-ctx.Done():
+			runErr = ctx.Err()
+			break timer
+		}
+	}
+	// The model often finishes printing the analysis before omp finishes
+	// finalizing — a partial or timeout-terminated buffer still parses.
+	res := parse(outBuf.String())
+	if res.Verdict == "unknown" {
+		if runErr == nil {
+			runErr = fmt.Errorf("no verdict in output")
+		}
 		tail := errBuf.String()
 		if len(tail) > 300 {
 			tail = tail[len(tail)-300:]
 		}
-		return Analysis{}, fmt.Errorf("omp: %w: %s", err, tail)
+		return Analysis{}, fmt.Errorf("omp: %w: %s", runErr, tail)
 	}
-	return parse(string(out)), nil
+	return res, nil
 }
 
-// sectionRe tolerates the agent's markdown habits: **ВЕРДИКТ:**, bullets,
-// bold headers. Case-insensitive (Cyrillic included).
+// sectionRe tolerates the model's markdown habits: **ВЕРДИКТ:**, bullets.
 var sectionRe = regexp.MustCompile(`(?i)^[\s\*\#>_-]*(ВЕРДИКТ|ЛОВУШКИ|СОВЕТ|ПИСЬМО)[\s\*\#>_-]*:?(.*)$`)
 
 func parse(raw string) Analysis {
