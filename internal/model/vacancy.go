@@ -25,7 +25,7 @@ type Vacancy struct {
 
 // Compact renders the card as one plain-text line for prompts.
 func (v Vacancy) Compact() string {
-	parts := []string{"[" + v.Source + "] " + v.Title}
+	parts := []string{v.Title}
 	if v.Employer != "" {
 		parts = append(parts, "работодатель: "+v.Employer)
 	}

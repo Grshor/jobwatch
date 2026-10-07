@@ -61,9 +61,12 @@ func (a Analyzer) AnalyzeText(ctx context.Context, vacancyText string) (Analysis
 	defer cancel()
 
 	prompt := fmt.Sprintf(promptTmpl, a.ResumeText, vacancyText)
-	args := []string{"--no-session", "-p", prompt}
+	// --no-tools is the load-bearing flag: the analysis is a pure text
+	// completion. With tools the model occasionally goes agent-mode and
+	// starts "applying edits" to the resume directory instead of answering.
+	args := []string{"--no-session", "--no-tools", "-p", prompt}
 	if a.WorkDir != "" {
-		args = []string{"--no-session", "--cwd", a.WorkDir, "-p", prompt}
+		args = append([]string{"--no-session", "--no-tools", "--cwd", a.WorkDir}, args[len(args)-2:]...)
 	}
 	cmd := exec.CommandContext(ctx, a.Bin, args...)
 	var errBuf, outBuf strings.Builder
@@ -89,8 +92,9 @@ timer:
 	// finalizing — a partial or timeout-terminated buffer still parses.
 	res := parse(outBuf.String())
 	if res.Verdict == "unknown" {
+		out := outBuf.String()
 		if runErr == nil {
-			runErr = fmt.Errorf("no verdict in output")
+			runErr = fmt.Errorf("no verdict in output (%d chars): %.200q", len(out), out)
 		}
 		tail := errBuf.String()
 		if len(tail) > 300 {

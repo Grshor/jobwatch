@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"sort"
 	"sync"
 	"time"
 )
@@ -46,9 +47,10 @@ func (s *State) MarkApplied(id string) {
 }
 
 type State struct {
-	mu   sync.Mutex
-	path string
-	Seen map[string]Entry `json:"seen"`
+	mu      sync.Mutex
+	path    string
+	Seen    map[string]Entry `json:"seen"`
+	Pending []string         `json:"pending,omitempty"` // seen "yes"-verdicts awaiting analysis
 }
 
 // Open loads (or initializes) the state file.
@@ -103,6 +105,33 @@ func (s *State) Save() error {
 	return os.Rename(tmp, s.path)
 }
 
+// QueuePending appends ids awaiting analysis (ordered, deduped).
+func (s *State) QueuePending(ids ...string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	have := map[string]bool{}
+	for _, id := range s.Pending {
+		have[id] = true
+	}
+	for _, id := range ids {
+		if !have[id] {
+			s.Pending = append(s.Pending, id)
+		}
+	}
+}
+
+// PopPending returns up to n queued ids (oldest first).
+func (s *State) PopPending(n int) []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if n > len(s.Pending) {
+		n = len(s.Pending)
+	}
+	out := append([]string(nil), s.Pending[:n]...)
+	s.Pending = s.Pending[n:]
+	return out
+}
+
 // Prune drops entries older than ttl to keep the file bounded.
 func (s *State) Prune(ttl time.Duration) {
 	s.mu.Lock()
@@ -112,4 +141,29 @@ func (s *State) Prune(ttl time.Duration) {
 			delete(s.Seen, id)
 		}
 	}
+}
+
+// BootstrapPending seeds the queue from Seen: every gated-yes/uncertain
+// vacancy without a letter, oldest first. Called once at startup when the
+// queue is empty — an upgrade path from the pre-queue eras.
+func (s *State) BootstrapPending() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.Pending) > 0 {
+		return
+	}
+	var ids []string
+	oldest := map[string]string{}
+	for id, e := range s.Seen {
+		switch e.Verdict {
+		case "да", "сомнительно", "ungated":
+			if e.Letter != "" {
+				continue // already analyzed and delivered
+			}
+			ids = append(ids, id)
+			oldest[id] = e.Seen.Format(time.RFC3339Nano)
+		}
+	}
+	sort.Slice(ids, func(i, j int) bool { return oldest[ids[i]] < oldest[ids[j]] })
+	s.Pending = ids
 }

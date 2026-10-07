@@ -14,6 +14,19 @@ queries:
   - source: hirify
     text: "golang"
     hirify_pages: 2     # hirify live-search API, anonymous
+  # source: hirify-feed — use a filter SAVED ON hirify.me as-is:
+  #   ./jobwatch -config config.yml -list-feeds   → pick the id
+  # - source: hirify-feed
+  #   feed_id: 123
+
+# deterministic pre-gate rules: reject before any model call.
+# regex over title + employer + salary + source extras.
+rules:
+  reject_regex:
+    - "(?i)казино|букмекер|betting|i\s?-?gaming|ставк"
+    - "(?i)1[сc]\s?(разработчик|программист)"
+    - "(?i)(джуниор|junior|intern|стажер)"
+    - "(?i)(7|8|9|10)\+?\s*(лет|год[аов]?)\s*(опыта)?"   # over 6 years experience
 
 gate:
   bin: lm

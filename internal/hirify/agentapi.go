@@ -300,6 +300,7 @@ func (v card) toModel() model.Vacancy {
 // FullVacancy is the full vacancy payload from GET /vacancies/{id}.
 type FullVacancy struct {
 	Title   string `json:"title"`
+	Slug    string `json:"slug"`
 	Company string `json:"company"`
 	Salary  *struct {
 		Currency    string `json:"currency"`
@@ -363,4 +364,11 @@ func (f *FullVacancy) Render() string {
 	}
 	b.WriteString("\n\n" + f.Description)
 	return b.String()
+}
+
+// Feeds lists the account's saved searches (hirify.me filters).
+func (c *Client) Feeds(ctx context.Context) (json.RawMessage, error) {
+	var feeds json.RawMessage
+	err := c.get(ctx, "/api/agent/feeds", &feeds)
+	return feeds, err
 }

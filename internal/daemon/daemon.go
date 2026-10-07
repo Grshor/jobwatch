@@ -10,6 +10,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -34,6 +35,7 @@ type Config struct {
 		AreaID      int      `yaml:"area_id"`
 		RemoteOnly  bool     `yaml:"remote_only"`
 		HirifyPages int      `yaml:"hirify_pages"`
+		FeedID      int      `yaml:"feed_id"` // source: hirify-feed — site-saved filter
 		Grade       []string `yaml:"grade"`
 		WorkFormat  []string `yaml:"work_format"`
 		RemoteType  []string `yaml:"remote_type"`
@@ -50,6 +52,9 @@ type Config struct {
 		Token  string `yaml:"token"`
 		ChatID int64  `yaml:"chat_id"`
 	} `yaml:"telegram"`
+	Rules struct {
+		RejectRegex []string `yaml:"reject_regex"` // deterministic pre-gate rejections
+	} `yaml:"rules"`
 	Hirify struct {
 		Key          string `yaml:"key"` // or env HIRIFY_AGENT_KEY; needs agent:apply for buttons
 		ProfileID    *int   `yaml:"profile_id"`
@@ -64,6 +69,7 @@ type Daemon struct {
 	cfg        Config
 	hirify     *hirify.Client
 	resumeText string
+	reject     []*regexp.Regexp
 	gate       gate.Gate
 	agent      agent.Analyzer
 	tg         *tg.Client
@@ -91,6 +97,15 @@ func New(cfg Config, st *store.State, stdout bool) *Daemon {
 	cfg.Agent.WorkDir = expand(cfg.Agent.WorkDir)
 	cfg.Agent.ResumeHint = expand(cfg.Agent.ResumeHint)
 	d := &Daemon{cfg: cfg, stdout: stdout, st: st}
+	st.BootstrapPending() // upgrade path: queue the pre-queue "yes" backlog
+	for _, p := range cfg.Rules.RejectRegex {
+		re, err := regexp.Compile(p)
+		if err != nil {
+			log.Printf("rule %q: %v — skipped", p, err)
+			continue
+		}
+		d.reject = append(d.reject, re)
+	}
 	if b, err := os.ReadFile(cfg.Agent.ResumeHint); err == nil {
 		d.resumeText = string(b)
 		log.Printf("resume loaded: %s (%d chars)", cfg.Agent.ResumeHint, len(b))
@@ -160,6 +175,12 @@ func (d *Daemon) Cycle(ctx context.Context) {
 				pages = 2
 			}
 			vs, err = d.searchHirify(ctx, q, pages)
+		case "hirify-feed":
+			if d.hirify == nil {
+				log.Printf("hirify key not configured — skipping feed %d", q.FeedID)
+				continue
+			}
+			vs, err = d.hirify.FeedVacancies(ctx, q.FeedID, 1, 50)
 		default:
 			vs, err = hh.Search(ctx, hh.SearchURL(q.Text, q.AreaID, q.RemoteOnly))
 		}
@@ -173,16 +194,41 @@ func (d *Daemon) Cycle(ctx context.Context) {
 			}
 		}
 	}
-	if len(candidates) == 0 {
-		return
+	if len(candidates) > 0 {
+		log.Printf("new candidates: %d", len(candidates))
 	}
-	log.Printf("new candidates: %d", len(candidates))
 
+	byID := map[string]model.Vacancy{}
+	for _, v := range candidates {
+		byID[v.ID] = v
+	}
+
+	// process(): schedule one vacancy for analysis within this cycle's quota
 	analyzed := 0
 	var jobs []model.Vacancy
+	process := func(v model.Vacancy) bool {
+		if ctx.Err() != nil || analyzed >= d.cfg.MaxAnalyzePerCycle {
+			return false
+		}
+		if !d.budgetLeft() {
+			log.Printf("daily card budget spent (%d)", d.cfg.MaxCardsPerDay)
+			return false
+		}
+		analyzed++
+		jobs = append(jobs, v)
+		return true
+	}
+
+	// pass 1: gate every new candidate; classify
+	var pendingIDs []string // "yes"/uncertain without an analysis slot this cycle
 	for _, v := range candidates {
 		if ctx.Err() != nil {
 			return
+		}
+		if why, blocked := d.rejectMatch(v); blocked {
+			d.st.Mark(v.ID, "rule-отклонено")
+			log.Printf("rules: skip %s (%s): %s", v.ID, v.Title, why)
+			continue
 		}
 		verdict, err := d.gate.Decide(ctx, v)
 		d.st.Mark(v.ID, verdict.Answer)
@@ -192,22 +238,26 @@ func (d *Daemon) Cycle(ctx context.Context) {
 		switch verdict.Answer {
 		case "нет":
 			continue
-		case "сомнительно":
-			// analyze only if quota remains at the end — handled by fallthrough order
+		case "да", "сомнительно", "ungated":
+			if !process(v) {
+				pendingIDs = append(pendingIDs, v.ID)
+			}
 		}
-		if verdict.Answer != "да" && verdict.Answer != "сомнительно" && verdict.Answer != "ungated" {
+	}
+
+	log.Printf("pending queue: %d", len(d.st.Pending))
+	// pass 2: backlog from previous cycles — oldest first, still in quota.
+	// Ids absent from this fetch are dropped: Seen keeps them marked, so no
+	// re-carding; their text is refetchable only via a search hit anyway.
+	for _, id := range d.st.PopPending(d.cfg.MaxAnalyzePerCycle) {
+		if v, ok := byID[id]; ok {
+			process(v)
 			continue
 		}
-		if analyzed >= d.cfg.MaxAnalyzePerCycle {
-			continue // stays seen; re-surface logic is a v0.2 concern
-		}
-		if !d.budgetLeft() {
-			log.Printf("daily card budget spent (%d)", d.cfg.MaxCardsPerDay)
-			return
-		}
-		analyzed++
-		jobs = append(jobs, v)
+		// not in this fetch: analyzeAndNotify refetches the full text by ID
+		process(model.Vacancy{Source: "hirify", ID: id})
 	}
+
 	// parallel analyses: each is one plain model completion now
 	workers := d.cfg.AnalysisWorkers
 	if workers < 1 {
@@ -241,10 +291,12 @@ func (d *Daemon) searchHirify(ctx context.Context, q struct {
 	AreaID      int      `yaml:"area_id"`
 	RemoteOnly  bool     `yaml:"remote_only"`
 	HirifyPages int      `yaml:"hirify_pages"`
+	FeedID      int      `yaml:"feed_id"` // source: hirify-feed — site-saved filter
 	Grade       []string `yaml:"grade"`
 	WorkFormat  []string `yaml:"work_format"`
 	RemoteType  []string `yaml:"remote_type"`
-}, pages int) ([]model.Vacancy, error) {
+}, pages int,
+) ([]model.Vacancy, error) {
 	f := hirify.Filters{Search: q.Text, Params: []string{"title", "company"}, Grade: q.Grade, WorkFormat: q.WorkFormat, RemoteType: q.RemoteType}
 	var out []model.Vacancy
 	for p := 1; p <= pages; p++ {
@@ -267,6 +319,12 @@ func (d *Daemon) analyzeAndNotify(ctx context.Context, v model.Vacancy) {
 			if id, err := strconv.Atoi(idStr); err == nil {
 				if fv, err := d.hirify.FullVacancy(ctx, id); err == nil {
 					vacText = fv.Render()
+					if v.Slug == "" {
+						v.Slug = fv.Slug
+					}
+					if v.Title == "" {
+						v.Title = fv.Title
+					}
 				} else {
 					log.Printf("full vacancy %s: %v (fallback: карточка)", v.ID, err)
 				}
@@ -292,6 +350,21 @@ func (d *Daemon) analyzeAndNotify(ctx context.Context, v model.Vacancy) {
 		d.st.SetCover(v.ID, v.Slug, a.Letter)
 	}
 	d.send(v, a)
+}
+
+// rejectMatch applies deterministic pre-gate rules; returns the matched
+// pattern when the vacancy must be skipped without any model calls.
+func (d *Daemon) rejectMatch(v model.Vacancy) (string, bool) {
+	if len(d.reject) == 0 {
+		return "", false
+	}
+	haystack := strings.Join([]string{v.Title, v.Employer, v.Compensation, v.Extra}, " \n")
+	for _, re := range d.reject {
+		if re.MatchString(haystack) {
+			return re.String(), true
+		}
+	}
+	return "", false
 }
 
 func (d *Daemon) send(v model.Vacancy, a agent.Analysis) {
