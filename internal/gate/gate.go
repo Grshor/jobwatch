@@ -10,6 +10,7 @@ import (
 	"fmt"
 	"os/exec"
 	"strings"
+	"time"
 
 	"github.com/Grshor/jobwatch/internal/model"
 )
@@ -32,8 +33,11 @@ type Gate struct {
 	StateTmpl string // optional wrapper; vacancy Compact() is appended
 }
 
-// Decide asks the local decider about one vacancy.
+// Decide asks the local decider about one vacancy. Hard 60s cap: a wedged
+// llama-server must cost one vacancy's gate, not the whole cycle.
 func (g Gate) Decide(ctx context.Context, v model.Vacancy) (Verdict, error) {
+	ctx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
 	cmd := exec.CommandContext(ctx, g.LMBin, "decide",
 		"--question", g.Question,
 		"--options", "да,нет,сомнительно",

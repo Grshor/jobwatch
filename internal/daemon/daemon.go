@@ -139,6 +139,9 @@ func (d *Daemon) ServeCallbacks(ctx context.Context) {
 // Cycle runs one fetch→gate→analyze→notify pass. Blocking; errors per stage
 // are logged, not fatal.
 func (d *Daemon) Cycle(ctx context.Context) {
+	start := time.Now()
+	log.Printf("cycle begin")
+	defer func() { log.Printf("cycle end (%s)", time.Since(start).Round(time.Second)) }()
 	d.countReset()
 	var candidates []model.Vacancy
 	for _, q := range d.cfg.Queries {
