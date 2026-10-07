@@ -135,3 +135,8 @@ func (c *Client) Poll(ctx context.Context, prefix string, fn func(callbackID, da
 		}
 	}
 }
+
+// Plain sends text without any keyboard.
+func (c *Client) Plain(ctx context.Context, text string) error {
+	return c.Keyboard(ctx, text, nil)
+}

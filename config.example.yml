@@ -49,4 +49,5 @@ telegram:
   chat_id: 0
 
 max_analyze_per_cycle: 3
+analysis_timeout: 10m   # per-analysis cap; glm-style thinking can run long
 max_cards_per_day: 10

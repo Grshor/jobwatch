@@ -5,6 +5,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os/exec"
 	"regexp"
@@ -43,12 +44,8 @@ const promptTmpl = `Ты — придирчивый senior-кандидат, о�
 %s
 </vacancy>
 
-Проанализируй вакансию и ответь СТРОГО в этом формате (без markdown-разметки заголовков):
-
-ВЕРДИКТ: откликаться | пропускать
-ЛОВУШКИ: (скрининговые фильтры против резюме, вилки ниже ожиданий, агентство/аутстафф под видом продукта, тестовое до отклика, признаки мёртвой вакансии — по одной строке; если чисто — «нет»)
-СОВЕТ: (1–2 строки: какие буллеты резюме подчеркнуть под эту вакансию)
-ПИСЬМО: (сопроводительное от первого лица, 4–6 строк, по-русски, только реальный опыт из резюме)
+Проанализируй вакансию. Ответь ОДНИМ JSON-объектом без какого-либо другого текста:
+{"verdict":"откликаться|пропускать","traps":"скрининговые фильтры против резюме, вилки ниже ожиданий, агентство/аутстафф под видом продукта, тестовое до отклика, признаки мёртвой вакансии — по одной строке через ; ; если чисто — нет","advice":"1-2 строки: какие буллеты резюме подчеркнуть под эту вакансию","letter":"сопроводительное от первого лица, 4-6 строк, по-русски, только реальный опыт из резюме"}
 `
 
 // AnalyzeText runs one completion over resume+vacancy texts.
@@ -109,6 +106,40 @@ timer:
 var sectionRe = regexp.MustCompile(`(?i)^[\s\*\#>_-]*(ВЕРДИКТ|ЛОВУШКИ|СОВЕТ|ПИСЬМО)[\s\*\#>_-]*:?(.*)$`)
 
 func parse(raw string) Analysis {
+	if a, ok := parseJSON(raw); ok {
+		return a
+	}
+	return parseText(raw)
+}
+
+// parseJSON extracts the first {...} block and reads the protocol fields.
+func parseJSON(raw string) (Analysis, bool) {
+	i, j := strings.Index(raw, "{"), strings.LastIndex(raw, "}")
+	if i < 0 || j <= i {
+		return Analysis{}, false
+	}
+	var payload struct {
+		Verdict string `json:"verdict"`
+		Traps   string `json:"traps"`
+		Advice  string `json:"advice"`
+		Letter  string `json:"letter"`
+	}
+	if err := json.Unmarshal([]byte(raw[i:j+1]), &payload); err != nil {
+		return Analysis{}, false
+	}
+	a := Analysis{Verdict: "unknown", Traps: payload.Traps, Advice: payload.Advice, Letter: payload.Letter, Raw: raw}
+	switch {
+	case strings.Contains(payload.Verdict, "пропуск"):
+		a.Verdict = "пропускать"
+	case strings.Contains(payload.Verdict, "отклик"):
+		a.Verdict = "откликаться"
+	default:
+		return Analysis{}, false
+	}
+	return a, true
+}
+
+func parseText(raw string) Analysis {
 	a := Analysis{Verdict: "unknown", Raw: raw}
 	cur := ""
 	var b strings.Builder

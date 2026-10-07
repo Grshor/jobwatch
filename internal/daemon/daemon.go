@@ -60,9 +60,10 @@ type Config struct {
 		ProfileID    *int   `yaml:"profile_id"`
 		ApplyEnabled bool   `yaml:"apply_enabled"`
 	} `yaml:"hirify"`
-	MaxAnalyzePerCycle int `yaml:"max_analyze_per_cycle"`
-	AnalysisWorkers    int `yaml:"analysis_workers"`
-	MaxCardsPerDay     int `yaml:"max_cards_per_day"`
+	MaxAnalyzePerCycle int           `yaml:"max_analyze_per_cycle"`
+	AnalysisWorkers    int           `yaml:"analysis_workers"`
+	AnalysisTimeout    time.Duration `yaml:"analysis_timeout"`
+	MaxCardsPerDay     int           `yaml:"max_cards_per_day"`
 }
 
 type Daemon struct {
@@ -116,7 +117,11 @@ func New(cfg Config, st *store.State, stdout bool) *Daemon {
 		d.hirify = hirify.New(cfg.Hirify.Key)
 	}
 	d.gate = gate.Gate{LMBin: cfg.Gate.Bin, Question: cfg.Gate.Question}
-	d.agent = agent.Analyzer{Bin: "omp", WorkDir: cfg.Agent.WorkDir, ResumeText: d.resumeText, Timeout: 5 * time.Minute}
+	at := cfg.AnalysisTimeout
+	if at == 0 {
+		at = 10 * time.Minute
+	}
+	d.agent = agent.Analyzer{Bin: "omp", WorkDir: cfg.Agent.WorkDir, ResumeText: d.resumeText, Timeout: at}
 	if !stdout {
 		d.tg = tg.New(cfg.TG.Token, cfg.TG.ChatID)
 	}
@@ -325,6 +330,9 @@ func (d *Daemon) analyzeAndNotify(ctx context.Context, v model.Vacancy) {
 					if v.Title == "" {
 						v.Title = fv.Title
 					}
+					if v.URL == "" && fv.Slug != "" {
+						v.URL = "https://hirify.me/jobs/" + fv.Slug
+					}
 				} else {
 					log.Printf("full vacancy %s: %v (fallback: карточка)", v.ID, err)
 				}
@@ -389,15 +397,15 @@ func (d *Daemon) send(v model.Vacancy, a agent.Analysis) {
 		label = "Открыть на hirify"
 	}
 	if !d.stdout {
-		_, canApply := "", false
-		if _, letter, ok := d.st.Cover(v.ID); ok && letter != "" && d.cfg.Hirify.ApplyEnabled {
-			canApply = true
-		}
+		_, letter, hasCover := d.st.Cover(v.ID)
+		canApply := hasCover && letter != "" && d.cfg.Hirify.ApplyEnabled && v.URL != ""
 		var err error
 		if canApply {
 			err = d.tg.CardWithApply(context.Background(), text, "✅ Откликнуться (hirify)", "apply:"+v.ID, label, v.URL)
-		} else {
+		} else if v.URL != "" {
 			err = d.tg.Card(context.Background(), text, label, v.URL)
+		} else {
+			err = d.tg.Plain(context.Background(), text)
 		}
 		if err != nil {
 			log.Printf("telegram: %v", err)
