@@ -35,6 +35,8 @@ gate:
     Москва или удалёнка, не агентство и не аутстафф, не 1С и не Java,
     зарплата от 400к gross?
 
+analysis_model: zai/glm-5.3-flash   # empty = omp default
+
 agent:
   work_dir: ~/Projects/career/jobseeker
   resume_hint: ~/Projects/career/jobseeker/resume-2026.md

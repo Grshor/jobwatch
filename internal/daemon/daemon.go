@@ -52,7 +52,8 @@ type Config struct {
 		Token  string `yaml:"token"`
 		ChatID int64  `yaml:"chat_id"`
 	} `yaml:"telegram"`
-	Rules struct {
+	AnalysisModel string `yaml:"analysis_model"` // pin the analysis model (omp --model)
+	Rules         struct {
 		RejectRegex []string `yaml:"reject_regex"` // deterministic pre-gate rejections
 	} `yaml:"rules"`
 	Hirify struct {
@@ -121,7 +122,7 @@ func New(cfg Config, st *store.State, stdout bool) *Daemon {
 	if at == 0 {
 		at = 10 * time.Minute
 	}
-	d.agent = agent.Analyzer{Bin: "omp", WorkDir: cfg.Agent.WorkDir, ResumeText: d.resumeText, Timeout: at}
+	d.agent = agent.Analyzer{Bin: "omp", WorkDir: cfg.Agent.WorkDir, ResumeText: d.resumeText, Timeout: at, Model: cfg.AnalysisModel}
 	if !stdout {
 		d.tg = tg.New(cfg.TG.Token, cfg.TG.ChatID)
 	}

@@ -30,6 +30,7 @@ type Analyzer struct {
 	WorkDir    string
 	Timeout    time.Duration
 	ResumeText string // the candidate's resume, read once at startup
+	Model      string // optional --model pin (e.g. zai/glm-5.3-flash)
 }
 
 const promptTmpl = `Ты — придирчивый senior-кандидат, оцениваешь вакансию перед откликом. Ожидания: senior Go backend, Москва или удалёнка, от 400к gross, не агентство и не аутстафф.
@@ -61,9 +62,13 @@ func (a Analyzer) AnalyzeText(ctx context.Context, vacancyText string) (Analysis
 	// --no-tools is the load-bearing flag: the analysis is a pure text
 	// completion. With tools the model occasionally goes agent-mode and
 	// starts "applying edits" to the resume directory instead of answering.
-	args := []string{"--no-session", "--no-tools", "-p", prompt}
+	head := []string{"--no-session", "--no-tools"}
+	if a.Model != "" {
+		head = append(head, "--model", a.Model)
+	}
+	args := append(head, "-p", prompt)
 	if a.WorkDir != "" {
-		args = append([]string{"--no-session", "--no-tools", "--cwd", a.WorkDir}, args[len(args)-2:]...)
+		args = append(head, "--cwd", a.WorkDir, "-p", prompt)
 	}
 	cmd := exec.CommandContext(ctx, a.Bin, args...)
 	var errBuf, outBuf strings.Builder
