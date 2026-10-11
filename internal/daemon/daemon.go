@@ -238,6 +238,9 @@ func (d *Daemon) Cycle(ctx context.Context) {
 		}
 		verdict, err := d.gate.Decide(ctx, v)
 		d.st.Mark(v.ID, verdict.Answer)
+		if verdict.Prob > 0 {
+			d.st.SetMatch(v.ID, verdict.Prob)
+		}
 		if err != nil {
 			log.Printf("gate %s: %v", v.ID, err)
 		}
@@ -378,6 +381,9 @@ func (d *Daemon) rejectMatch(v model.Vacancy) (string, bool) {
 
 func (d *Daemon) send(v model.Vacancy, a agent.Analysis) {
 	text := fmt.Sprintf("🔧 %s\n%s", v.Title, v.Compact())
+	if p := d.st.Match(v.ID); p > 0 {
+		text += fmt.Sprintf("\n🎯 мэтч: %.0f%%", p*100)
+	}
 	if a.Traps != "" {
 		text += "\n\n⚠️ Ловушки:\n" + a.Traps
 	}

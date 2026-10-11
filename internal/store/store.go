@@ -15,9 +15,26 @@ import (
 type Entry struct {
 	Seen    time.Time `json:"seen"`
 	Verdict string    `json:"verdict,omitempty"`
+	Match   float64   `json:"match,omitempty"`  // gate probability for "да", 0..1
 	Letter  string    `json:"letter,omitempty"` // agent-drafted cover letter
 	Slug    string    `json:"slug,omitempty"`   // hirify slug for apply
 	Applied bool      `json:"applied,omitempty"`
+}
+
+// SetMatch records the gate's match probability for an id.
+func (s *State) SetMatch(id string, p float64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	e := s.Seen[id]
+	e.Match = p
+	s.Seen[id] = e
+}
+
+// Match returns the stored gate probability.
+func (s *State) Match(id string) float64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.Seen[id].Match
 }
 
 // SetCover stores the letter+slug for a later apply callback.
